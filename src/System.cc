@@ -25,14 +25,24 @@
 #include <thread>
 #include <pangolin/pangolin.h>
 #include <iomanip>
+#include <unistd.h>
+
 
 namespace ORB_SLAM2
 {
 
 System::System(const string &strVocFile, const string &strSettingsFile, const eSensor sensor,
-               const bool bUseViewer):mSensor(sensor), mpViewer(static_cast<Viewer*>(NULL)), mbReset(false),mbActivateLocalizationMode(false),
-        mbDeactivateLocalizationMode(false)
+               const bool bUseViewer):mSensor(sensor), mpViewer(static_cast<Viewer*>(NULL)), 
+               mbReset(false),mbActivateLocalizationMode(false),
+               mbDeactivateLocalizationMode(false)
 {
+
+    // 主要流程:
+    // 1、加载ORB词汇表，构建Vocabulary，以及关键帧数据集库
+	// 2、初始化追踪主线程，但是未运行
+	// 3、初始化局部建图，回环闭合线程，且运行
+	// 4、创建可视化线程，并且与追踪主线程关联起来。
+
     // Output welcome message
     cout << endl <<
     "ORB-SLAM2 Copyright (C) 2014-2016 Raul Mur-Artal, University of Zaragoza." << endl <<
@@ -61,6 +71,7 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
     //Load ORB Vocabulary
     cout << endl << "Loading ORB Vocabulary. This could take a while..." << endl;
 
+    // 主要作用：特征匹配，关键帧辨别
     mpVocabulary = new ORBVocabulary();
     bool bVocLoad = mpVocabulary->loadFromTextFile(strVocFile);
     if(!bVocLoad)
@@ -88,7 +99,7 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
 
     //Initialize the Local Mapping thread and launch
     mpLocalMapper = new LocalMapping(mpMap, mSensor==MONOCULAR);
-    mptLocalMapping = new thread(&ORB_SLAM2::LocalMapping::Run,mpLocalMapper);
+    mptLocalMapping = new thread(&ORB_SLAM2::LocalMapping::Run, mpLocalMapper);
 
     //Initialize the Loop Closing thread and launch
     mpLoopCloser = new LoopClosing(mpMap, mpKeyFrameDatabase, mpVocabulary, mSensor!=MONOCULAR);
@@ -217,6 +228,19 @@ cv::Mat System::TrackRGBD(const cv::Mat &im, const cv::Mat &depthmap, const doub
 
 cv::Mat System::TrackMonocular(const cv::Mat &im, const double &timestamp)
 {
+
+    // 1、判断传感器的类型是否为单目模式，如果不是，则表示设置错误，函数直接返回
+    
+	// 2、上锁 模式锁(mMutexMode):
+	// 	(1)如果目前需要激活定位模式，则请求停止局部建图，并且等待局部建图线程停止，设置为仅追踪模式。
+	// 	(2)如果目前需要取消定位模式，则通知局部建图可以工作了，关闭仅追踪模式
+		
+	// 3、上锁 复位锁(mMutexReset): 检查是否存在复位请求，如果有，则进行复位操作
+
+	// 4、核心部分: 根据输入的图像获得相机位姿态（其中包含了特征提取匹配，地图初始化，关键帧查询等操作）
+
+	// 5、进行数据更新，如追踪状态、当前帧的地图点、当前帧矫正之后的关键点等。
+
     if(mSensor!=MONOCULAR)
     {
         cerr << "ERROR: you called TrackMonocular but input sensor was not set to Monocular." << endl;
@@ -225,7 +249,9 @@ cv::Mat System::TrackMonocular(const cv::Mat &im, const double &timestamp)
 
     // Check mode change
     {
+        // 独占锁，主要是为了mbActivateLocalizationMode和mbDeactivateLocalizationMode不会发生混乱
         unique_lock<mutex> lock(mMutexMode);
+        // mbActivateLocalizationMode为true会关闭局部地图线程
         if(mbActivateLocalizationMode)
         {
             mpLocalMapper->RequestStop();
@@ -235,10 +261,13 @@ cv::Mat System::TrackMonocular(const cv::Mat &im, const double &timestamp)
             {
                 usleep(1000);
             }
-
+            // 局部地图关闭以后，只进行追踪的线程，只计算相机的位姿，没有对局部地图进行更新
+            // 设置mbOnlyTracking为真
             mpTracker->InformOnlyTracking(true);
+            // 关闭线程可以使得别的线程得到更多的资源
             mbActivateLocalizationMode = false;
         }
+        // 如果 mbDeactivateLocalizationMode 是true，局部地图线程就被释放, 关键帧从局部地图中删除.
         if(mbDeactivateLocalizationMode)
         {
             mpTracker->InformOnlyTracking(false);
@@ -257,6 +286,7 @@ cv::Mat System::TrackMonocular(const cv::Mat &im, const double &timestamp)
     }
     }
 
+    //  获取相机位姿的估计结果
     cv::Mat Tcw = mpTracker->GrabImageMonocular(im,timestamp);
 
     unique_lock<mutex> lock2(mMutexState);
